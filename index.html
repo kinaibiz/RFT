@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RFT for Quest</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<style>
+  :root { --bg:#111; --fg:#e8e8e8; --muted:#9a9a9a; --accent:#7fb3ff; --warn:#ffb86b; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 system-ui, sans-serif; }
+  main { max-width:880px; margin:0 auto; padding:16px; }
+  h1 { font-size:22px; margin:8px 0 4px; }
+  h2 { font-size:17px; margin:20px 0 6px; color:var(--accent); }
+  label { display:block; margin:8px 0 2px; color:var(--muted); font-size:14px; }
+  input, select, textarea { width:100%; box-sizing:border-box; background:#1c1c1c; color:var(--fg);
+    border:1px solid #333; border-radius:6px; padding:8px; font:inherit; }
+  textarea { font-family:ui-monospace, monospace; font-size:13px; min-height:300px; }
+  button { background:var(--accent); color:#000; border:0; border-radius:8px; padding:12px 18px;
+    font:600 16px system-ui; margin:8px 8px 0 0; cursor:pointer; }
+  button.secondary { background:#333; color:var(--fg); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  pre { background:#1c1c1c; padding:10px; border-radius:6px; overflow:auto; font-size:13px; }
+  .warn { color:var(--warn); }
+  .muted { color:var(--muted); font-size:14px; }
+  table { border-collapse:collapse; font-size:13px; width:100%; }
+  td, th { border-bottom:1px solid #333; padding:4px 6px; text-align:right; }
+  td.l, th.l { text-align:left; }
+  td button { padding:6px 10px; font-size:13px; margin:0 4px 0 0; }
+  .ok { color:#8fd18f; }
+  #offline { border:1px solid #333; border-radius:8px; padding:8px 12px; margin:8px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Rod and Frame Test（Meta Quest 3S / WebXR）</h1>
+  <p id="xrStatus" class="muted">WebXR を確認しています…</p>
+  <div id="offline" class="muted">
+    <div id="swStatus">オフライン保存を確認しています…</div>
+    <div id="persistStatus"></div>
+    <button class="secondary" id="btnUpdate" hidden>新しい版を適用</button>
+  </div>
+
+  <h2>1. 参加者</h2>
+  <label for="pid">参加者ID（必須）</label>
+  <input id="pid" placeholder="例：P001">
+  <label for="slabel">セッション名（任意）</label>
+  <input id="slabel" placeholder="例：pre">
+
+  <h2>2. 設定</h2>
+  <label for="preset">プリセット</label>
+  <select id="preset"></select>
+  <label for="cfg">設定（JSON・編集可）</label>
+  <textarea id="cfg" spellcheck="false"></textarea>
+  <button class="secondary" id="btnCheck">設定を確認</button>
+  <pre id="geom"></pre>
+
+  <h2>3. 実行</h2>
+  <button id="btnStart" disabled>VRで開始</button>
+  <p class="muted">VR内の操作：右スティック左右＝ロッドを回す／右トリガーまたはA＝決定／B＝刺激位置を頭の正面に再設定（試行間のみ）。左コントローラーでも同じ操作ができます。</p>
+
+  <h2>4. 今回の結果</h2>
+  <div id="result" class="muted">まだデータはありません。</div>
+
+  <h2>5. 保存済みのセッション（この Quest 内）</h2>
+  <p class="muted">各試行が終わるたびに自動で保存されます。ブラウザの閲覧データを消去すると消えるため、定期的に「全データのバックアップ」を保存してください。</p>
+  <div id="sessions" class="muted">読み込み中…</div>
+  <button class="secondary" id="btnAllCsv">全セッションをまとめてCSV保存</button>
+  <button class="secondary" id="btnBackup">全データのバックアップ（JSON）</button>
+  <button class="secondary" id="btnImport">バックアップから取り込む</button>
+  <input type="file" id="fileImport" accept=".json,application/json" hidden>
+  <p id="storage" class="muted"></p>
+</main>
+
+<script type="module">
+import * as THREE from './three.module.js';
+import * as RFT from './rft-core.js';
+import * as Store from './rft-store.js';
+
+const $ = (id) => document.getElementById(id);
+
+// ---------- 設定 UI ----------
+for (const name of Object.keys(RFT.PRESETS)) {
+  const o = document.createElement('option'); o.value = name; o.textContent = name; $('preset').appendChild(o);
+}
+function presetJSON(name) {
+  const c = { ...RFT.DEFAULT_CONFIG, ...RFT.PRESETS[name] };
+  delete c.participantId; delete c.sessionLabel;
+  return JSON.stringify(c, null, 2);
+}
+$('cfg').value = presetJSON($('preset').value);
+$('preset').onchange = () => { $('cfg').value = presetJSON($('preset').value); checkConfig(); };
+
+function readConfig() {
+  const user = JSON.parse($('cfg').value);
+  user.participantId = $('pid').value.trim();
+  user.sessionLabel = $('slabel').value.trim();
+  return RFT.mergeConfig(user);
+}
+function checkConfig() {
+  try {
+    const c = readConfig();
+    const g = RFT.geometry(c);
+    const trials = RFT.buildTrials(c);
+    $('geom').innerHTML =
+`フレーム一辺：${(g.frame_m*100).toFixed(1)} cm（仮想距離 ${c.viewingDistance_m} m）
+ロッド長　　：${(g.rod_m*100).toFixed(1)} cm
+線幅　　　　：${(g.line_m*1000).toFixed(1)} mm（${c.lineWidth_deg}°）
+隙間（片側）：約 ${g.gap_deg.toFixed(2)}°／${(g.gap_m*100).toFixed(2)} cm（線幅を引いた内縁まで）
+試行数　　　：${trials.length}（練習 ${c.practiceTrials} を含む）
+試行順　　　：${trials.map(t => `${t.practice?'練':''}F${t.frameTilt}/R${t.rodStart}`).join('  ')}`;
+    if (g.gap_m <= 0) $('geom').innerHTML += '\n<span class="warn">ロッドがフレームに接触または交差しています。</span>';
+    return c;
+  } catch (e) {
+    $('geom').innerHTML = `<span class="warn">${String(e.message).replace(/</g,'&lt;')}</span>`;
+    return null;
+  }
+}
+$('btnCheck').onclick = checkConfig;
+checkConfig();
+
+// ---------- WebXR 対応確認 ----------
+let xrOK = false;
+if (navigator.xr) {
+  navigator.xr.isSessionSupported('immersive-vr').then((ok) => {
+    xrOK = ok;
+    $('xrStatus').textContent = ok ? 'immersive-vr に対応しています。' : 'この端末では immersive-vr を使えません（Quest のブラウザで開いてください）。';
+    $('btnStart').disabled = !ok;
+  });
+} else {
+  $('xrStatus').textContent = 'WebXR が使えません。HTTPS か localhost で開いているか確認してください。';
+}
+
+// ---------- オフライン保存（Service Worker） ----------
+let waitingSW = null;
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js').then((reg) => {
+    const show = () => {
+      if (reg.waiting && navigator.serviceWorker.controller) {
+        waitingSW = reg.waiting;
+        $('swStatus').innerHTML = `<span class="warn">新しい版があります。実験と実験の間に「新しい版を適用」を押してください（現在 v${RFT.APP_VERSION}）。</span>`;
+        $('btnUpdate').hidden = false;
+      } else if (reg.active) {
+        $('swStatus').innerHTML = `<span class="ok">オフラインで起動できます（v${RFT.APP_VERSION}）。</span>`;
+      }
+    };
+    show();
+    reg.addEventListener('updatefound', () => {
+      const w = reg.installing;
+      w && w.addEventListener('statechange', show);
+    });
+    navigator.serviceWorker.ready.then(show);
+  }).catch((e) => { $('swStatus').innerHTML = `<span class="warn">オフライン保存に失敗しました：${e.message}</span>`; });
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (!reloaded && waitingSW) { reloaded = true; location.reload(); } });
+} else {
+  $('swStatus').innerHTML = '<span class="warn">この環境ではオフライン保存を使えません（HTTPS で開いているか確認してください）。</span>';
+}
+$('btnUpdate').onclick = () => {
+  if (state === 'trial' || state === 'iti' || xrSession) { alert('実験中は更新できません。'); return; }
+  if (waitingSW) waitingSW.postMessage('skipWaiting');
+};
+Store.requestPersist().then((ok) => {
+  $('persistStatus').innerHTML = ok ? '<span class="ok">データの自動削除防止：許可されています。</span>'
+    : '<span class="warn">データの自動削除防止：許可されていません。こまめにバックアップしてください。</span>';
+});
+
+// ---------- three.js ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(1);
+renderer.setClearColor(0x000000, 1);
+renderer.xr.enabled = true;
+renderer.domElement.style.display = 'none';
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+const camera = new THREE.PerspectiveCamera(90, 1, 0.01, 100);
+
+const anchor = new THREE.Group();   // 被験者の正面に置く。ローカル +z が被験者側。
+scene.add(anchor);
+const frameGroup = new THREE.Group();
+const rodMesh = new THREE.Mesh();
+anchor.add(frameGroup, rodMesh);
+
+let msgMesh = null;
+
+function colorOf(hex, k) { return new THREE.Color(hex).multiplyScalar(k); }
+
+function buildStimulus(c) {
+  frameGroup.clear();
+  const g = RFT.geometry(c);
+  const mat = new THREE.MeshBasicMaterial({ color: colorOf(c.frameColor, c.brightness) });
+  const s = g.frame_m, w = g.line_m;
+  // 中心線が一辺 s の正方形になるよう配置（角は重ねて隙間をなくす）
+  const horiz = new THREE.PlaneGeometry(s + w, w);
+  const vert = new THREE.PlaneGeometry(w, s + w);
+  const top = new THREE.Mesh(horiz, mat); top.position.y = s / 2;
+  const bot = new THREE.Mesh(horiz, mat); bot.position.y = -s / 2;
+  const lft = new THREE.Mesh(vert, mat); lft.position.x = -s / 2;
+  const rgt = new THREE.Mesh(vert, mat); rgt.position.x = s / 2;
+  frameGroup.add(top, bot, lft, rgt);
+  rodMesh.geometry = new THREE.PlaneGeometry(w, g.rod_m);
+  rodMesh.material = new THREE.MeshBasicMaterial({ color: colorOf(c.rodColor, c.brightness) });
+  rodMesh.position.z = 0.001;        // フレームとの Z ファイティング防止
+  frameGroup.visible = false; rodMesh.visible = false;
+}
+
+function setMessage(text) {
+  if (msgMesh) { anchor.remove(msgMesh); msgMesh.material.map.dispose(); msgMesh = null; }
+  if (!text) return;
+  const cv = document.createElement('canvas'); cv.width = 1024; cv.height = 256;
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, 1024, 256);
+  ctx.fillStyle = '#5a5a5a'; ctx.font = '48px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  text.split('\n').forEach((line, i, arr) => ctx.fillText(line, 512, 128 + (i - (arr.length - 1) / 2) * 64));
+  const tex = new THREE.CanvasTexture(cv);
+  msgMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 0.25), new THREE.MeshBasicMaterial({ map: tex }));
+  // 刺激面より手前（被験者寄り）に、視距離に関係なく約1.2 m先に見えるよう配置
+  msgMesh.position.z = Math.max(0, cfg.viewingDistance_m - 1.2);
+  anchor.add(msgMesh);
+}
+
+// 刺激の向き：three はローカル z 軸まわり正回転が「被験者から見て反時計回り」なので符号を反転
+const setRod = (degCW) => { rodMesh.rotation.z = -THREE.MathUtils.degToRad(degCW); };
+const setFrame = (degCW) => { frameGroup.rotation.z = -THREE.MathUtils.degToRad(degCW); };
+
+// ---------- 頭部姿勢 ----------
+const _q = new THREE.Quaternion(), _r = new THREE.Vector3(), _f = new THREE.Vector3();
+function headAngles(pose) {
+  const o = pose.transform.orientation;
+  _q.set(o.x, o.y, o.z, o.w);
+  _r.set(1, 0, 0).applyQuaternion(_q);   // 頭の右方向
+  _f.set(0, 0, -1).applyQuaternion(_q);  // 頭の前方向
+  // 右耳が下がる＝被験者から見て時計回りの頭部傾斜 → 正
+  const roll = THREE.MathUtils.radToDeg(Math.atan2(-_r.y, Math.hypot(_r.x, _r.z)));
+  const pitch = THREE.MathUtils.radToDeg(Math.atan2(_f.y, Math.hypot(_f.x, _f.z)));
+  return { roll, pitch };
+}
+let anchorHeadPos = new THREE.Vector3();
+function placeAnchor(pose) {
+  const p = pose.transform.position, o = pose.transform.orientation;
+  _q.set(o.x, o.y, o.z, o.w);
+  _f.set(0, 0, -1).applyQuaternion(_q); _f.y = 0;
+  if (_f.lengthSq() < 1e-6) _f.set(0, 0, -1);
+  _f.normalize();
+  anchorHeadPos.set(p.x, p.y, p.z);
+  anchor.position.set(p.x + _f.x * cfg.viewingDistance_m, p.y, p.z + _f.z * cfg.viewingDistance_m);
+  anchor.lookAt(p.x, p.y, p.z);   // ローカル +z を被験者へ向ける（ロールは 0 ＝重力鉛直）
+}
+
+// ---------- 入力 ----------
+const prevBtn = new Map();
+function readInput(session) {
+  let stickX = 0, confirm = false, recenter = false, chosen = null;
+  for (const src of session.inputSources) {
+    if (!src.gamepad) continue;
+    if (!chosen || src.handedness === 'right') chosen = src;
+  }
+  for (const src of session.inputSources) {
+    const gp = src.gamepad; if (!gp) continue;
+    const key = src.handedness;
+    const prev = prevBtn.get(key) || {};
+    const pressed = (i) => !!(gp.buttons[i] && gp.buttons[i].pressed);
+    const now = { trig: pressed(0), a: pressed(4), b: pressed(5) };
+    if ((now.trig && !prev.trig) || (now.a && !prev.a)) confirm = true;
+    if (now.b && !prev.b) recenter = true;
+    prevBtn.set(key, now);
+    if (src === chosen) stickX = gp.axes.length >= 4 ? gp.axes[2] : (gp.axes[0] || 0);
+  }
+  return { stickX, confirm, recenter };
+}
+
+// ---------- 実験の状態機械 ----------
+let cfg = RFT.DEFAULT_CONFIG, trials = [], rows = [], tIdx = 0;
+let state = 'idle', stateT0 = 0, lastT = 0, needPlace = true;
+let rod = 0, res = null, stepArmed = true;
+let xrSession = null;
+let session = null;   // 保存用のセッション記録
+
+function startTrial(now) {
+  const t = trials[tIdx];
+  rod = t.rodStart;
+  setRod(rod);
+  if (t.frameTilt === 'none') frameGroup.visible = false;
+  else { setFrame(t.frameTilt); frameGroup.visible = true; }
+  rodMesh.visible = true;
+  res = { rodFinal: NaN, rt: NaN, timedOut: false, nAdjust: 0, rolls: [], pitches: [], dts: [], dispMax_mm: 0 };
+  state = 'trial'; stateT0 = now; stepArmed = true;
+}
+
+function endTrial(now, timedOut) {
+  res.rodFinal = rod; res.rt = now - stateT0; res.timedOut = timedOut;
+  rows.push(RFT.makeRow(cfg, trials[tIdx], res, session.id));
+  saveSession(tIdx + 1 >= trials.length);
+  frameGroup.visible = false; rodMesh.visible = false;
+  tIdx++;
+  if (tIdx >= trials.length) {
+    state = 'done'; stateT0 = now; setMessage('終了です。\nお疲れさまでした。');
+  } else {
+    // 練習から本試行へ移る直前に一度止める
+    if (trials[tIdx - 1].practice && !trials[tIdx].practice) {
+      state = 'idle'; setMessage('練習は終わりです。\n本番を始めるにはトリガーを引いてください。');
+    } else { state = 'iti'; stateT0 = now; }
+  }
+}
+
+function onXRFrame(time, frame) {
+  const now = time;
+  const dt = lastT ? now - lastT : 0; lastT = now;
+  const pose = frame && frame.getViewerPose(renderer.xr.getReferenceSpace());
+  if (pose) {
+    if (needPlace) { placeAnchor(pose); needPlace = false; }
+    const inp = readInput(xrSession);
+
+    if (inp.recenter && state !== 'trial') placeAnchor(pose);
+
+    if (state === 'idle') {
+      if (inp.confirm) { setMessage(null); state = 'iti'; stateT0 = now; }
+    } else if (state === 'iti') {
+      if (now - stateT0 >= cfg.itiMs) startTrial(now);
+    } else if (state === 'trial') {
+      // 回転
+      if (cfg.adjustMode === 'continuous') {
+        const rate = RFT.stickToRate(inp.stickX, cfg);
+        if (rate !== 0) { rod += rate * dt / 1000; res.nAdjust++; }
+      } else {
+        if (Math.abs(inp.stickX) > 0.6 && stepArmed) { rod += Math.sign(inp.stickX) * cfg.step_deg; res.nAdjust++; stepArmed = false; }
+        if (Math.abs(inp.stickX) < 0.3) stepArmed = true;
+      }
+      rod = Math.max(-89, Math.min(89, rod));
+      setRod(rod);
+      // 記録
+      const a = headAngles(pose);
+      res.rolls.push(a.roll); res.pitches.push(a.pitch);
+      if (dt > 0) res.dts.push(dt);
+      const p = pose.transform.position;
+      const d = Math.hypot(p.x - anchorHeadPos.x, p.y - anchorHeadPos.y, p.z - anchorHeadPos.z) * 1000;
+      if (d > res.dispMax_mm) res.dispMax_mm = d;
+      // 確定・時間切れ
+      const el = now - stateT0;
+      if (inp.confirm && el >= cfg.minResponseMs) endTrial(now, false);
+      else if (cfg.maxTrialMs > 0 && el >= cfg.maxTrialMs) endTrial(now, true);
+    } else if (state === 'done') {
+      if (now - stateT0 > 3000) { xrSession.end(); state = 'ended'; }
+    }
+  }
+  renderer.render(scene, camera);
+}
+
+// ---------- 開始・終了 ----------
+$('btnStart').onclick = async () => {
+  const c = checkConfig();
+  if (!c) return;
+  if (!c.participantId) { alert('参加者IDを入力してください。'); return; }
+  cfg = c;
+  trials = RFT.buildTrials(cfg); rows = []; tIdx = 0;
+  session = {
+    id: Store.newSessionId(cfg.participantId),
+    appVersion: RFT.APP_VERSION,
+    participantId: cfg.participantId,
+    sessionLabel: cfg.sessionLabel,
+    startedISO: new Date().toISOString(),
+    endedISO: null,
+    completed: false,
+    nPlanned: trials.length,
+    config: cfg,
+    trials,
+    userAgent: navigator.userAgent,
+    rows,
+  };
+  saveSession(false);
+  buildStimulus(cfg);
+  try {
+    xrSession = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor'] });
+  } catch (e) { alert('VRを開始できませんでした：' + e.message); return; }
+  renderer.xr.setFramebufferScaleFactor(cfg.framebufferScale);
+  renderer.xr.setReferenceSpaceType('local-floor');
+  try { await renderer.xr.setSession(xrSession); }
+  catch (e) { renderer.xr.setReferenceSpaceType('local'); await renderer.xr.setSession(xrSession); }
+  renderer.xr.setFoveation(cfg.foveation);
+  state = 'idle'; needPlace = true; lastT = 0; prevBtn.clear();
+  setMessage(trials[0] && trials[0].practice ? '練習を始めます。\n準備ができたらトリガーを引いてください。'
+                                             : '準備ができたらトリガーを引いてください。');
+  xrSession.addEventListener('end', onSessionEnd);
+  renderer.setAnimationLoop(onXRFrame);
+};
+
+function onSessionEnd() {
+  renderer.setAnimationLoop(null);
+  setMessage(null);
+  xrSession = null; state = 'ended';
+  saveSession(rows.length >= trials.length);
+  showResults(rows, trials.length);
+}
+
+let saving = Promise.resolve();
+function saveSession(completed) {
+  if (!session) return;
+  session.rows = rows;
+  session.completed = completed || session.completed;
+  session.endedISO = new Date().toISOString();
+  const snap = JSON.parse(JSON.stringify(session));
+  saving = saving.then(() => Store.putSession(snap)).then(refreshSessions)
+    .catch((e) => { console.error(e); $('storage').innerHTML = `<span class="warn">保存に失敗しました：${e.message}</span>`; });
+}
+
+function showResults(r, total) {
+  const main = r.filter((x) => !x.practice);
+  const abs = main.map((x) => x.absError_deg);
+  const rm = (v) => Number.isFinite(v) ? v.toFixed(2) : '—';
+  let html = `<p>記録：${r.length}${total ? ' / ' + total : ''} 試行（本試行 ${main.length}）。本試行の平均絶対誤差 ${rm(RFT.mean(abs))}°、SD ${rm(RFT.sd(abs))}°</p>`;
+  html += '<table><tr><th>#</th><th>練</th><th>フレーム</th><th>開始</th><th>最終</th><th>誤差</th><th>RT(s)</th><th>頭ロール平均</th></tr>';
+  for (const x of r) html += `<tr><td>${x.index}</td><td>${x.practice ? '○' : ''}</td><td>${x.frameTilt_deg}</td><td>${x.rodStart_deg}</td><td>${rm(x.rodFinal_deg)}</td><td>${rm(x.signedError_deg)}</td><td>${rm(x.rt_ms / 1000)}</td><td>${rm(x.headRollMean_deg)}</td></tr>`;
+  $('result').innerHTML = html + '</table>';
+}
+
+function download(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+}
+const stamp = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+const esc = (v) => String(v ?? '').replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+
+async function refreshSessions() {
+  let list = [];
+  try { list = await Store.listSessions(); }
+  catch (e) { $('sessions').innerHTML = `<span class="warn">読み込めませんでした：${esc(e.message)}</span>`; return; }
+  if (!list.length) { $('sessions').textContent = '保存済みのセッションはありません。'; }
+  else {
+    let h = '<table><tr><th class="l">開始日時</th><th class="l">参加者</th><th class="l">セッション</th><th>試行</th><th class="l">状態</th><th class="l">操作</th></tr>';
+    for (const x of list) {
+      const dt = new Date(x.startedISO).toLocaleString('ja-JP');
+      h += `<tr><td class="l">${esc(dt)}</td><td class="l">${esc(x.participantId)}</td><td class="l">${esc(x.sessionLabel)}</td>`
+        + `<td>${x.rows.length}/${x.nPlanned}</td><td class="l">${x.completed ? '<span class="ok">完了</span>' : '<span class="warn">中断</span>'}</td>`
+        + `<td class="l"><button class="secondary" data-act="csv" data-id="${esc(x.id)}">CSV</button>`
+        + `<button class="secondary" data-act="view" data-id="${esc(x.id)}">表示</button>`
+        + `<button class="secondary" data-act="del" data-id="${esc(x.id)}">削除</button></td></tr>`;
+    }
+    $('sessions').innerHTML = h + '</table>';
+  }
+  const est = await Store.estimate();
+  if (est && est.usage != null) $('storage').textContent = `使用容量：約 ${(est.usage / 1024 / 1024).toFixed(1)} MB／割り当て ${(est.quota / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+$('sessions').addEventListener('click', async (ev) => {
+  const b = ev.target.closest('button[data-act]'); if (!b) return;
+  const s = await Store.getSession(b.dataset.id); if (!s) return;
+  if (b.dataset.act === 'csv') {
+    download(`RFT_${s.id}.csv`, RFT.toCSV(s.rows), 'text/csv');
+  } else if (b.dataset.act === 'view') {
+    showResults(s.rows, s.nPlanned);
+    $('result').scrollIntoView();
+  } else if (b.dataset.act === 'del') {
+    if (!confirm(`${s.participantId}（${new Date(s.startedISO).toLocaleString('ja-JP')}）のデータを削除します。元に戻せません。\n先にCSVかバックアップを保存しましたか？`)) return;
+    await Store.deleteSession(s.id); refreshSessions();
+  }
+});
+
+$('btnAllCsv').onclick = async () => {
+  const list = await Store.listSessions();
+  const all = list.slice().reverse().flatMap((x) => x.rows);
+  if (!all.length) { alert('データがありません。'); return; }
+  download(`RFT_all_${stamp()}.csv`, RFT.toCSV(all), 'text/csv');
+};
+$('btnBackup').onclick = async () => {
+  const list = await Store.listSessions();
+  download(`RFT_backup_${stamp()}.json`, JSON.stringify({ format: 'rft-backup', appVersion: RFT.APP_VERSION, exportedISO: new Date().toISOString(), sessions: list }, null, 2), 'application/json');
+};
+$('btnImport').onclick = () => $('fileImport').click();
+$('fileImport').onchange = async () => {
+  const f = $('fileImport').files[0]; if (!f) return;
+  try {
+    const data = JSON.parse(await f.text());
+    const list = Array.isArray(data) ? data : data.sessions;
+    if (!Array.isArray(list)) throw new Error('バックアップの形式ではありません');
+    const r = await Store.importSessions(list);
+    alert(`取り込み：${r.added} 件追加、${r.skipped} 件は既存または不正のため省略しました。`);
+    refreshSessions();
+  } catch (e) { alert('取り込めませんでした：' + e.message); }
+  $('fileImport').value = '';
+};
+refreshSessions();
+</script>
+</body>
+</html>
